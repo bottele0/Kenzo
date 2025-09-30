@@ -4,7 +4,7 @@ import requests
 import json
 import base58
 from solders.keypair import Keypair
-from solders.pubkey import Pubkey
+from solders.pubkey import Pubkey as PublicKey
 from solana.rpc.api import Client
 from telegram import (
     Update,
@@ -30,10 +30,10 @@ TOKEN = os.getenv("BOT_TOKEN")
 SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
 solana_client = Client(SOLANA_RPC_URL)
 
-# DexScreener API for token data
+# DexScreener API for token data (best-effort; responses vary)
 DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
 
-# Wallet management
+# Wallet management (in-memory)
 user_wallets = {}  # Store user wallet data
 user_balances = {}  # Store user balances
 
@@ -112,6 +112,11 @@ def disconnect_confirm_keyboard():
          InlineKeyboardButton("❌ Cancel", callback_data="wallet_management")]
     ])
 
+def import_wallet_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Wallet", callback_data="wallet")]
+    ])
+
 # Messages
 def get_start_message():
     return (
@@ -137,7 +142,7 @@ def get_import_private_key_message():
         "Send me your Solana private key to import your wallet.\n\n"
         "⚠️ **Security Warning:** Make sure you trust this bot before sending your private key!\n\n"
         "📝 **Tips:**\n"
-        "• Private keys are usually 52-54 characters long\n"
+        "• Private keys are usually 52-54 characters long (base58 of 64 bytes) or 44-45 chars for 32-byte seeds\n"
         "• They should only contain letters and numbers\n"
         "• Never share your private key publicly"
     )
@@ -359,89 +364,140 @@ def get_support_help_message():
         "• Note any error messages"
     )
 
-# Real Data Integration Functions
+# ----------------------------
+# Real Data Integration Functions (fixed)
+# ----------------------------
+
 def get_solana_price_data():
-    """Get real SOL price data from CoinGecko"""
+    """Get real SOL price data from CoinGecko (robust parsing)."""
     try:
-        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true"
+        url = ("https://api.coingecko.com/api/v3/simple/price"
+               "?ids=solana&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true")
         response = requests.get(url, timeout=10)
         data = response.json()
 
         sol_data = data.get('solana', {})
+        price = sol_data.get('usd', 0)
+        change = sol_data.get('usd_24h_change', sol_data.get('usd_24h_change', 0))
+        vol = sol_data.get('usd_24h_vol', 0)
+        # convert volume to billions (match your previous formatting)
+        volume_b = vol / 1_000_000_000 if isinstance(vol, (int, float)) else 0
+
         return {
-            'price': sol_data.get('usd', 0),
-            'change_24h': sol_data.get('usd_24h_change', 0),
-            'volume': sol_data.get('usd_24h_vol', 0) / 1000000000  # Convert to billions
+            'price': price or 0,
+            'change_24h': change or 0,
+            'volume': volume_b or 0
         }
     except Exception as e:
         print(f"Error fetching SOL price: {e}")
         return {'price': 0, 'change_24h': 0, 'volume': 0}
 
-def is_valid_solana_private_key(private_key):
-    """Validate Solana private key using solders library"""
+def is_valid_solana_private_key(private_key_b58: str) -> bool:
+    """
+    Validate Solana private key: accept base58-encoded 64-byte secret OR 32-byte seed.
+    Returns True if it can be used to construct a Keypair.
+    """
     try:
-        # Try to decode base58
-        decoded = base58.b58decode(private_key)
+        decoded = base58.b58decode(private_key_b58)
+    except Exception as e:
+        # invalid base58
+        return False
 
-        # Solana private keys are 64 bytes
+    if len(decoded) not in (32, 64):
+        return False
+
+    try:
         if len(decoded) == 64:
-            # Try to create keypair to validate
-            keypair = Keypair.from_bytes(decoded)
-            return True
+            # secret key format (64 bytes)
+            Keypair.from_secret_key(decoded)
         else:
-            return False
+            # 32-byte seed
+            Keypair.from_seed(decoded)
+        return True
     except Exception as e:
         print(f"Private key validation error: {e}")
         return False
 
-def derive_public_key(private_key):
-    """Derive public key from private key using solders"""
+def derive_public_key(private_key_b58: str) -> str | None:
+    """
+    Derive public key from base58 private key.
+    Supports 32-byte seeds and 64-byte secret keys.
+    """
     try:
-        decoded = base58.b58decode(private_key)
-        keypair = Keypair.from_bytes(decoded)
-        return str(keypair.pubkey())
+        decoded = base58.b58decode(private_key_b58)
+    except Exception as e:
+        print(f"Base58 decode error: {e}")
+        return None
+
+    try:
+        if len(decoded) == 64:
+            kp = Keypair.from_secret_key(decoded)
+        elif len(decoded) == 32:
+            kp = Keypair.from_seed(decoded)
+        else:
+            return None
+        return str(kp.public_key)
     except Exception as e:
         print(f"Error deriving public key: {e}")
         return None
 
-def get_sol_balance(public_key):
-    """Get real SOL balance from Solana RPC"""
+def get_sol_balance(public_key: str) -> float:
+    """
+    Get SOL balance (in SOL) for a public key string.
+    Handles solana-py RPC response format.
+    """
     try:
-        pubkey = Pubkey.from_string(public_key)
-        response = solana_client.get_balance(pubkey)
+        # Accept string or PublicKey
+        pubkey_obj = PublicKey(public_key)
+        resp = solana_client.get_balance(pubkey_obj, commitment="confirmed")
+        # Typical shape: {'jsonrpc': '2.0', 'result': {'context': {...}, 'value': <lamports>}, 'id':1}
+        lamports = None
+        if isinstance(resp, dict):
+            lamports = resp.get("result", {}).get("value")
+        # some wrappers may return an object with 'value' attr
+        elif hasattr(resp, "value"):
+            lamports = getattr(resp, "value", None)
 
-        if response.value:
-            # Convert lamports to SOL
-            return response.value / 1000000000
-        return 0
+        if lamports is None:
+            return 0.0
+        return int(lamports) / 1_000_000_000.0
     except Exception as e:
         print(f"Error fetching balance: {e}")
-        return 0
+        return 0.0
 
 def search_token_info(search_term):
-    """Search for token information using DexScreener API"""
+    """Search for token information using DexScreener API (best-effort)."""
     try:
-        # First, try to search by symbol/name
+        # DexScreener's API shapes vary; try a few endpoints / patterns
+        # Primary attempt: search endpoint
         search_url = f"{DEXSCREENER_API}/search?q={search_term}"
         search_response = requests.get(search_url, timeout=10)
-        search_data = search_response.json()
+        search_data = {}
+        try:
+            search_data = search_response.json()
+        except Exception:
+            # if DexScreener returned HTML or other, bail
+            return None
 
-        pairs = search_data.get('pairs', [])
+        pairs = search_data.get('pairs') or search_data.get('pair') or []
+        if not pairs:
+            # sometimes DexScreener returns 'pairs' under 'result'
+            pairs = search_data.get('result', {}).get('pairs', []) if isinstance(search_data.get('result'), dict) else []
+
         if not pairs:
             return None
 
-        # Get the first pair (most relevant)
-        pair = pairs[0]
+        pair = pairs[0]  # take most relevant
 
         return {
             'name': pair.get('baseToken', {}).get('name', 'Unknown'),
             'symbol': pair.get('baseToken', {}).get('symbol', 'Unknown'),
-            'price': float(pair.get('priceUsd', 0)),
+            'price': float(pair.get('priceUsd', 0) or 0),
             'price_native': pair.get('priceNative', '0'),
-            'change_24h': float(pair.get('priceChange', {}).get('h24', 0)),
-            'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
-            'volume_24h': float(pair.get('volume', {}).get('h24', 0)),
-            'fdv': float(pair.get('fdv', 0)),
+            'change_24h': float((pair.get('priceChange') or {}).get('h24', 0) or 0),
+            'liquidity': float((pair.get('liquidity') or {}).get('usd', 0) or 0),
+            'volume_24h': float((pair.get('volume') or {}).get('h24', 0) or 0),
+            'fdv': float(pair.get('fdv', 0) or 0),
             'pair_address': pair.get('pairAddress', ''),
             'base_token_address': pair.get('baseToken', {}).get('address', ''),
             'dex_id': pair.get('dexId', ''),
@@ -452,14 +508,15 @@ def search_token_info(search_term):
         return None
 
 def generate_new_wallet():
-    """Generate a new Solana wallet"""
+    """Generate a new Solana wallet using solana-py Keypair."""
     try:
-        keypair = Keypair()
-        private_key = base58.b58encode(bytes(keypair)).decode('utf-8')
-        public_key = str(keypair.pubkey())
-
+        kp = Keypair.generate()
+        # secret_key is 64 bytes (private + pub)
+        secret_bytes = kp.secret_key
+        private_key_b58 = base58.b58encode(secret_bytes).decode('utf-8')
+        public_key = str(kp.public_key)
         return {
-            'private_key': private_key,
+            'private_key': private_key_b58,
             'public_key': public_key
         }
     except Exception as e:
@@ -467,17 +524,13 @@ def generate_new_wallet():
         return None
 
 def is_valid_seed_phrase(seed_phrase):
-    """Basic validation for seed phrase"""
+    """Basic validation for seed phrase (12 or 24 words)."""
     try:
         words = seed_phrase.strip().split()
-        # Check if we have 12 or 24 words
         if len(words) not in [12, 24]:
             return False
-
-        # Basic check - in production, use proper BIP39 validation
-        # For now, we'll check if all words are alphabetic and reasonable length
         for word in words:
-            if not word.isalpha() or len(word) < 3 or len(word) > 10:
+            if not word.isalpha() or len(word) < 2 or len(word) > 15:
                 return False
         return True
     except Exception as e:
@@ -485,37 +538,33 @@ def is_valid_seed_phrase(seed_phrase):
         return False
 
 def derive_wallet_from_seed_phrase(seed_phrase):
-    """Derive wallet from seed phrase"""
+    """
+    Simplified deterministic derivation from seed phrase.
+    NOTE: This is a simplified method (sha256 -> 32 bytes) and is NOT
+    BIP39/BIP44 compliant. Use proper libraries for production.
+    """
     try:
-        # Note: This is a simplified implementation
-        # In production, use proper BIP39 derivation with ed25519 curve
-        # For Solana, you'd typically use the m/44'/501'/0'/0' derivation path
-
-        # For now, we'll create a deterministic keypair from the seed phrase
-        # This is NOT secure for production - use proper cryptographic libraries
         import hashlib
-
-        # Create a deterministic seed from the phrase
         seed_bytes = hashlib.sha256(seed_phrase.encode()).digest()[:32]
-        keypair = Keypair.from_seed(seed_bytes)
-
-        private_key = base58.b58encode(bytes(keypair)).decode('utf-8')
-        public_key = str(keypair.pubkey())
-
+        kp = Keypair.from_seed(seed_bytes)
+        private_key_b58 = base58.b58encode(kp.secret_key).decode('utf-8')
+        public_key = str(kp.public_key)
         return {
-            'private_key': private_key,
+            'private_key': private_key_b58,
             'public_key': public_key
         }
     except Exception as e:
         print(f"Error deriving wallet from seed phrase: {e}")
         return None
 
+# ----------------------------
 # Handlers
+# ----------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_id in user_wallets:
-        # User has wallet connected - get real balance
         wallet = user_wallets[user_id]
         balance = get_sol_balance(wallet['public_key'])
         user_balances[user_id] = balance
@@ -527,7 +576,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard()
         )
     else:
-        # New user or no wallet
         await update.message.reply_text(
             text=get_start_message(),
             parse_mode=ParseMode.HTML,
@@ -545,7 +593,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
     if user_id in user_wallets:
-        # Update balance with real data
         wallet = user_wallets[user_id]
         balance = get_sol_balance(wallet['public_key'])
         user_balances[user_id] = balance
@@ -593,7 +640,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "main_menu":
         if user_id in user_wallets:
-            # Update with real balance
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -614,11 +660,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "refresh":
         if user_id in user_wallets:
-            # Update with real balance
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
 
+            await query.answer("🔄 Balance refreshed!", show_alert=True)
             await query.edit_message_text(
                 text=get_wallet_connected_main_menu(user_id),
                 parse_mode=ParseMode.HTML,
@@ -626,6 +672,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu_keyboard()
             )
         else:
+            await query.answer("🔄 Refreshed!", show_alert=True)
             await query.edit_message_text(
                 text=get_start_message(),
                 parse_mode=ParseMode.HTML,
@@ -635,7 +682,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "wallet":
         if user_id in user_wallets:
-            # Update with real balance
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -654,20 +700,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "import_private_key":
-        # Set state to await private key
+        # Clear other awaiting flags
+        context.user_data["awaiting_seed_phrase"] = False
+        context.user_data["awaiting_token_search"] = False
         context.user_data["awaiting_private_key"] = True
-        await query.edit_message_text(
+        await query.answer()
+        await query.message.reply_text(
             text=get_import_private_key_message(),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=import_wallet_keyboard()
         )
         return
 
     elif data == "import_seed_phrase":
-        # Set state to await seed phrase
+        # Clear other awaiting flags
+        context.user_data["awaiting_private_key"] = False
+        context.user_data["awaiting_token_search"] = False
         context.user_data["awaiting_seed_phrase"] = True
-        await query.edit_message_text(
+        await query.answer()
+        await query.message.reply_text(
             text=get_import_seed_phrase_message(),
-            parse_mode=ParseMode.HTML
+            parse_mode=ParseMode.HTML,
+            reply_markup=import_wallet_keyboard()
         )
         return
 
@@ -692,7 +746,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "check_status":
         if user_id in user_wallets:
-            # Update with real balance
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -708,7 +761,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "fund_wallet":
         if user_id in user_wallets:
-            # Update with real balance
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -724,7 +776,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "refresh_balance":
         if user_id in user_wallets:
-            # Get real balance from blockchain
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -771,7 +822,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "wallet_management":
         if user_id in user_wallets:
-            # Update with real balance
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -840,6 +890,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "search_tokens":
+        # Clear other awaiting flags
+        context.user_data["awaiting_private_key"] = False
+        context.user_data["awaiting_seed_phrase"] = False
         context.user_data["awaiting_token_search"] = True
         await query.edit_message_text(
             text=get_search_tokens_message(),
@@ -904,7 +957,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(
                 text="❌ Invalid private key format.\n\n"
-                     "Please send a valid Solana private key (base58 encoded, 64 bytes).",
+                     "Please send a valid Solana private key (base58 encoded, 64 bytes or 32-byte seed).",
                 parse_mode=ParseMode.HTML
             )
         return
@@ -1014,7 +1067,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # Check if message is a potential token search
+    # If message wasn't one of the awaited actions, treat it as a possible token search
     if len(message_text) > 0:
         context.user_data["awaiting_token_search"] = True
         await update.message.reply_text(
@@ -1033,7 +1086,7 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    print("Autosnipe AI Bot started with seed phrase support...")
+    print("Autosnipe AI Bot started (fixed RPC/key handling)...")
     app.run_polling()
 
 if __name__ == "__main__":
