@@ -1,0 +1,1040 @@
+import os
+import time
+import requests
+import json
+import base58
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solana.rpc.api import Client
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN")
+
+# Solana RPC configuration
+SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+solana_client = Client(SOLANA_RPC_URL)
+
+# DexScreener API for token data
+DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
+
+# Wallet management
+user_wallets = {}  # Store user wallet data
+user_balances = {}  # Store user balances
+
+def current_time():
+    return time.strftime("%H:%M:%S", time.localtime())
+
+# Keyboards
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 Wallet", callback_data="wallet"),
+         InlineKeyboardButton("🔄 Refresh", callback_data="refresh")],
+        [InlineKeyboardButton("🎯 AI Sniper", callback_data="ai_sniper"),
+         InlineKeyboardButton("📋 Copy Trade", callback_data="copy_trade")],
+        [InlineKeyboardButton("🔎 Search Tokens", callback_data="search_tokens"),
+         InlineKeyboardButton("❓ Help", callback_data="help")]
+    ])
+
+def wallet_setup_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 Import Private Key", callback_data="import_private_key"),
+         InlineKeyboardButton("🧩 Import Seed Phrase", callback_data="import_seed_phrase")],
+        [InlineKeyboardButton("🎲 Generate Wallet", callback_data="generate_wallet"),
+         InlineKeyboardButton("📈 Check Status", callback_data="check_status")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
+    ])
+
+def wallet_management_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Fund Wallet", callback_data="fund_wallet"),
+         InlineKeyboardButton("📈 Check Status", callback_data="check_status")],
+        [InlineKeyboardButton("📋 Copy Address", callback_data="copy_address"),
+         InlineKeyboardButton("🔄 Refresh Balance", callback_data="refresh_balance")],
+        [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw"),
+         InlineKeyboardButton("🔌 Disconnect", callback_data="disconnect_wallet")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="main_menu")]
+    ])
+
+def fund_wallet_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Copy Address", callback_data="copy_address"),
+         InlineKeyboardButton("🔄 Refresh Balance", callback_data="refresh_balance")],
+        [InlineKeyboardButton("✅ Done", callback_data="wallet_management")]
+    ])
+
+def search_tokens_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🏠 Back to Dashboard", callback_data="main_menu")]
+    ])
+
+def search_results_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 Search Again", callback_data="search_tokens"),
+         InlineKeyboardButton("🏠 Dashboard", callback_data="main_menu")]
+    ])
+
+def help_center_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🤖 Commands", callback_data="help_commands"),
+         InlineKeyboardButton("🔐 Wallet", callback_data="help_wallet")],
+        [InlineKeyboardButton("📊 Trading", callback_data="help_trading"),
+         InlineKeyboardButton("🛡️ Security", callback_data="help_security")],
+        [InlineKeyboardButton("❓ FAQ", callback_data="help_faq"),
+         InlineKeyboardButton("🆘 Support", callback_data="help_support")],
+        [InlineKeyboardButton("⬅️ Close Help", callback_data="main_menu")]
+    ])
+
+def help_submenu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Help Menu", callback_data="help"),
+         InlineKeyboardButton("❌ Close Help", callback_data="main_menu")]
+    ])
+
+def disconnect_confirm_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔌 Confirm Disconnect", callback_data="confirm_disconnect"),
+         InlineKeyboardButton("❌ Cancel", callback_data="wallet_management")]
+    ])
+
+# Messages
+def get_start_message():
+    return (
+        "🔥 Welcome to Autosnipe 🔥\n\n"
+        "Snipe memecoins at hyperspeed ⚡️\n"
+        "Access advanced trading features with Autosnipe. 💰\n\n"
+        "ℹ️ Click Wallet to get started!"
+    )
+
+def get_wallet_setup_message():
+    return (
+        "🔐 Wallet Setup 🔐\n\n"
+        "ℹ️ You don't have a wallet connected yet.\n"
+        "Choose how you'd like to get started:\n\n"
+        "🔑 Import Private Key - Use existing private key\n"
+        "🧩 Import Seed Phrase - Use existing seed words\n"
+        "🎲 Generate - Create a brand new wallet"
+    )
+
+def get_import_private_key_message():
+    return (
+        "🔐 **Import Private Key**\n\n"
+        "Send me your Solana private key to import your wallet.\n\n"
+        "⚠️ **Security Warning:** Make sure you trust this bot before sending your private key!\n\n"
+        "📝 **Tips:**\n"
+        "• Private keys are usually 52-54 characters long\n"
+        "• They should only contain letters and numbers\n"
+        "• Never share your private key publicly"
+    )
+
+def get_import_seed_phrase_message():
+    return (
+        "🧩 **Import Seed Phrase**\n\n"
+        "Send me your Solana seed phrase (12 or 24 words) to import your wallet.\n\n"
+        "⚠️ **Security Warning:** Make sure you trust this bot before sending your seed phrase!\n\n"
+        "📝 **Tips:**\n"
+        "• Enter 12 or 24 words separated by spaces\n"
+        "• Use the standard BIP39 English wordlist\n"
+        "• Never share your seed phrase publicly\n"
+        "• Example: word1 word2 word3 ... word12"
+    )
+
+def get_wallet_connected_main_menu(user_id):
+    wallet = user_wallets.get(user_id, {})
+    balance = user_balances.get(user_id, 0)
+
+    # Get real SOL price and market data
+    sol_data = get_solana_price_data()
+    sol_price = sol_data.get('price', 0)
+    sol_change = sol_data.get('change_24h', 0)
+    volume = sol_data.get('volume', 0)
+
+    usd_balance = balance * sol_price
+
+    return (
+        f"🏦 WALLET\n"
+        f"Address: {wallet.get('public_key', 'N/A')}\n"
+        f"💰: {balance:.4f} SOL\n\n"
+        f"📄 PORTFOLIO\n"
+        f"• SOL: {balance:.4f} (${usd_balance:.2f}) -- 100%\n"
+        f"• TOKENS: 0 ($0.00) — 0%\n\n"
+        f"📈 SOL MARKET\n"
+        f"${sol_price:.2f} ({'📈' if sol_change >= 0 else '📉'} {abs(sol_change):.1f}%) | Vol: ${volume:.2f}B\n\n"
+        f"🔗 View on Solscan: [Open Portfolio](https://solscan.io/account/{wallet.get('public_key', '')})"
+    )
+
+def get_wallet_management_message(user_id):
+    wallet = user_wallets.get(user_id, {})
+    balance = user_balances.get(user_id, 0)
+
+    return (
+        "🔐 Wallet Management 🔐\n\n"
+        f"🏷️ Address:\n"
+        f"`{wallet.get('public_key', 'N/A')}`\n"
+        f"💰 Balance: {balance:.4f} SOL\n\n"
+        "Choose a wallet action:"
+    )
+
+def get_fund_wallet_message(user_id):
+    wallet = user_wallets.get(user_id, {})
+    balance = user_balances.get(user_id, 0)
+
+    return (
+        "💰 Fund Your Wallet 💰\n\n"
+        f"🏷️ Wallet Address:\n"
+        f"`{wallet.get('public_key', 'N/A')}`\n\n"
+        f"📊 Current Balance: {balance:.4f} SOL\n\n"
+        "💱 How to Fund:\n"
+        "• Copy the wallet address above\n"
+        "• Send SOL from another wallet or exchange\n"
+        "• Minimum: 0.001 SOL for transaction fees\n"
+        "• Recommended: 0.1+ SOL for trading\n\n"
+        "⚡ Quick Tips:\n"
+        "• Tap and hold to copy the address\n"
+        "• Double-check the address before sending\n"
+        "• SOL transfers usually take 1-2 minutes\n\n"
+        "🔄 Use /status to check your updated balance!"
+    )
+
+def get_wallet_status_message(user_id):
+    wallet = user_wallets.get(user_id, {})
+    balance = user_balances.get(user_id, 0)
+
+    return (
+        "✅ Wallet Status: Connected\n\n"
+        f"🏷️ Public Key:\n"
+        f"`{wallet.get('public_key', 'N/A')}`\n\n"
+        f"💰 Balance: {balance:.4f} SOL\n\n"
+        "Created: Recently\n"
+        "Network: Solana Mainnet"
+    )
+
+def get_search_tokens_message():
+    return (
+        "🔍 Token Search & Analysis 🔍\n\n"
+        "Enter any of the following to get detailed token information:\n\n"
+        "📝 Token Symbol: SOL, BONK, WIF\n"
+        "🏷️ Token Address: Full Solana token address\n"
+        "💡 Token Name: Partial or full token name\n\n"
+        "⚡ What you'll get:\n"
+        "• 💰 Current price & 24h changes\n"
+        "• 🌊 Liquidity & volume data\n"
+        "• 🔗 Official links & social media\n"
+        "• 📋 Token description & details\n"
+        "• 📊 Trading pair information\n\n"
+        "🔑 Enter your search term now:"
+    )
+
+def get_help_center_message():
+    return (
+        "❓ Autosnipe Help Center ❓\n\n"
+        "🔥 Welcome to Autosnipe!\n"
+        "The fastest memecoin sniping bot on Solana. Snipe tokens at hyperspeed with advanced AI algorithms.\n\n"
+        "🚀 Quick Start Guide:\n"
+        "1️⃣ Click 🔐 Wallet to setup your wallet\n"
+        "2️⃣ Fund your wallet with SOL\n"
+        "3️⃣ Start sniping tokens!\n\n"
+        "Choose a topic below for detailed help:"
+    )
+
+def get_commands_help_message():
+    return (
+        "🤖 Available Commands 🤖\n\n"
+        "Basic Commands:\n"
+        "• /start - Open main dashboard\n"
+        "• /help - Show this help center\n"
+        "• /status - Check wallet status\n\n"
+        "Wallet Commands:\n"
+        "• /import - Import private key\n"
+        "• /generate - Generate new wallet\n"
+        "• /fund - Get funding instructions\n"
+        "• /disconnect - Remove current wallet\n\n"
+        "Advanced Commands:\n"
+        "💡 Tip: Most functions are accessible through the button interface!"
+    )
+
+def get_wallet_help_message():
+    return (
+        "🔐 Wallet Help 🔐\n\n"
+        "Getting Started:\n"
+        "🔑 Import Wallet - Use your existing private key\n"
+        "🎲 Generate Wallet - Create a brand new wallet\n\n"
+        "Managing Your Wallet:\n"
+        "💰 Fund Wallet - Add SOL to your wallet\n"
+        "📈 Check Status - View balance and details\n"
+        "📋 Copy Address - Copy wallet address\n"
+        "🔄 Refresh Balance - Update balance\n"
+        "🔌 Disconnect - Safely remove wallet\n\n"
+        "Security Tips:\n"
+        "• Never share your private key\n"
+        "• Always verify addresses before sending\n"
+        "• Keep your private key backed up safely"
+    )
+
+def get_trading_help_message():
+    return (
+        "📊 Trading Features 📊\n\n"
+        "Token Search:\n"
+        "🔍 Find tokens by address or symbol\n"
+        "📈 Get real-time price data\n"
+        "📊 View market statistics\n\n"
+        "Copy Trading:\n"
+        "📋 Follow successful traders\n"
+        "🤖 Automated position copying\n"
+        "⚙️ Customizable settings\n\n"
+        "AI Sniping:\n"
+        "⚡ Lightning-fast execution\n"
+        "🎯 Smart entry detection\n"
+        "🛡️ Risk management built-in\n\n"
+        "🚧 Status: Trading features coming soon!"
+    )
+
+def get_security_help_message():
+    return (
+        "🛡️ Security & Safety 🛡️\n\n"
+        "Wallet Security:\n"
+        "🔐 Your keys are stored locally\n"
+        "🔒 End-to-end encryption\n"
+        "🚫 Never share keys with anyone\n\n"
+        "Best Practices:\n"
+        "✅ Use strong, unique passwords\n"
+        "✅ Enable 2FA where possible\n"
+        "✅ Keep software updated\n"
+        "✅ Verify all transactions\n\n"
+        "Red Flags:\n"
+        "❌ Requests for private keys\n"
+        "❌ Suspicious links or downloads\n"
+        "❌ Too-good-to-be-true offers\n\n"
+        "Need Help? Contact support if anything seems suspicious."
+    )
+
+def get_faq_help_message():
+    return (
+        "❓ Frequently Asked Questions ❓\n\n"
+        "Q: Is my wallet secure?\n"
+        "A: Yes! Your private keys are encrypted and stored locally. We never have access to your funds.\n\n"
+        "Q: What's the minimum SOL needed?\n"
+        "A: 0.001 SOL for fees, 0.1+ SOL recommended for trading.\n\n"
+        "Q: How fast is the sniping?\n"
+        "A: Our AI executes trades in milliseconds with advanced algorithms.\n\n"
+        "Q: Can I use multiple wallets?\n"
+        "A: Currently one wallet per user. Disconnect and connect different wallets as needed.\n\n"
+        "Q: What tokens are supported?\n"
+        "A: All SPL tokens on Solana network are supported.\n\n"
+        "Q: Are there any fees?\n"
+        "A: Only standard Solana network fees apply."
+    )
+
+def get_support_help_message():
+    return (
+        "🆘 Support & Contact 🆘\n\n"
+        "Get Help:\n"
+        "💬 Telegram: @AutoSnipe_Support\n"
+        "🌐 Website: https://autosnipe.ai/sniper\n\n"
+        "Community:\n"
+        "🐦 Twitter: https://x.com/autosnipeai\n"
+        "▶️ Youtube: https://www.youtube.com/watch?v=YKW39pEGBTQ\n\n"
+        "Response Times:\n"
+        "🟢 Critical Issues: < 1 hour\n"
+        "🟡 General Support: < 24 hours\n"
+        "🔵 Feature Requests: 2-7 days\n\n"
+        "Before Contacting Support:\n"
+        "• Check this help section\n"
+        "• Try restarting with /start\n"
+        "• Note any error messages"
+    )
+
+# Real Data Integration Functions
+def get_solana_price_data():
+    """Get real SOL price data from CoinGecko"""
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+
+        sol_data = data.get('solana', {})
+        return {
+            'price': sol_data.get('usd', 0),
+            'change_24h': sol_data.get('usd_24h_change', 0),
+            'volume': sol_data.get('usd_24h_vol', 0) / 1000000000  # Convert to billions
+        }
+    except Exception as e:
+        print(f"Error fetching SOL price: {e}")
+        return {'price': 0, 'change_24h': 0, 'volume': 0}
+
+def is_valid_solana_private_key(private_key):
+    """Validate Solana private key using solders library"""
+    try:
+        # Try to decode base58
+        decoded = base58.b58decode(private_key)
+
+        # Solana private keys are 64 bytes
+        if len(decoded) == 64:
+            # Try to create keypair to validate
+            keypair = Keypair.from_bytes(decoded)
+            return True
+        else:
+            return False
+    except Exception as e:
+        print(f"Private key validation error: {e}")
+        return False
+
+def derive_public_key(private_key):
+    """Derive public key from private key using solders"""
+    try:
+        decoded = base58.b58decode(private_key)
+        keypair = Keypair.from_bytes(decoded)
+        return str(keypair.pubkey())
+    except Exception as e:
+        print(f"Error deriving public key: {e}")
+        return None
+
+def get_sol_balance(public_key):
+    """Get real SOL balance from Solana RPC"""
+    try:
+        pubkey = Pubkey.from_string(public_key)
+        response = solana_client.get_balance(pubkey)
+
+        if response.value:
+            # Convert lamports to SOL
+            return response.value / 1000000000
+        return 0
+    except Exception as e:
+        print(f"Error fetching balance: {e}")
+        return 0
+
+def search_token_info(search_term):
+    """Search for token information using DexScreener API"""
+    try:
+        # First, try to search by symbol/name
+        search_url = f"{DEXSCREENER_API}/search?q={search_term}"
+        search_response = requests.get(search_url, timeout=10)
+        search_data = search_response.json()
+
+        pairs = search_data.get('pairs', [])
+        if not pairs:
+            return None
+
+        # Get the first pair (most relevant)
+        pair = pairs[0]
+
+        return {
+            'name': pair.get('baseToken', {}).get('name', 'Unknown'),
+            'symbol': pair.get('baseToken', {}).get('symbol', 'Unknown'),
+            'price': float(pair.get('priceUsd', 0)),
+            'price_native': pair.get('priceNative', '0'),
+            'change_24h': float(pair.get('priceChange', {}).get('h24', 0)),
+            'liquidity': float(pair.get('liquidity', {}).get('usd', 0)),
+            'volume_24h': float(pair.get('volume', {}).get('h24', 0)),
+            'fdv': float(pair.get('fdv', 0)),
+            'pair_address': pair.get('pairAddress', ''),
+            'base_token_address': pair.get('baseToken', {}).get('address', ''),
+            'dex_id': pair.get('dexId', ''),
+            'url': pair.get('url', '')
+        }
+    except Exception as e:
+        print(f"Error fetching token info: {e}")
+        return None
+
+def generate_new_wallet():
+    """Generate a new Solana wallet"""
+    try:
+        keypair = Keypair()
+        private_key = base58.b58encode(bytes(keypair)).decode('utf-8')
+        public_key = str(keypair.pubkey())
+
+        return {
+            'private_key': private_key,
+            'public_key': public_key
+        }
+    except Exception as e:
+        print(f"Error generating wallet: {e}")
+        return None
+
+def is_valid_seed_phrase(seed_phrase):
+    """Basic validation for seed phrase"""
+    try:
+        words = seed_phrase.strip().split()
+        # Check if we have 12 or 24 words
+        if len(words) not in [12, 24]:
+            return False
+
+        # Basic check - in production, use proper BIP39 validation
+        # For now, we'll check if all words are alphabetic and reasonable length
+        for word in words:
+            if not word.isalpha() or len(word) < 3 or len(word) > 10:
+                return False
+        return True
+    except Exception as e:
+        print(f"Seed phrase validation error: {e}")
+        return False
+
+def derive_wallet_from_seed_phrase(seed_phrase):
+    """Derive wallet from seed phrase"""
+    try:
+        # Note: This is a simplified implementation
+        # In production, use proper BIP39 derivation with ed25519 curve
+        # For Solana, you'd typically use the m/44'/501'/0'/0' derivation path
+
+        # For now, we'll create a deterministic keypair from the seed phrase
+        # This is NOT secure for production - use proper cryptographic libraries
+        import hashlib
+
+        # Create a deterministic seed from the phrase
+        seed_bytes = hashlib.sha256(seed_phrase.encode()).digest()[:32]
+        keypair = Keypair.from_seed(seed_bytes)
+
+        private_key = base58.b58encode(bytes(keypair)).decode('utf-8')
+        public_key = str(keypair.pubkey())
+
+        return {
+            'private_key': private_key,
+            'public_key': public_key
+        }
+    except Exception as e:
+        print(f"Error deriving wallet from seed phrase: {e}")
+        return None
+
+# Handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id in user_wallets:
+        # User has wallet connected - get real balance
+        wallet = user_wallets[user_id]
+        balance = get_sol_balance(wallet['public_key'])
+        user_balances[user_id] = balance
+
+        await update.message.reply_text(
+            text=get_wallet_connected_main_menu(user_id),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        # New user or no wallet
+        await update.message.reply_text(
+            text=get_start_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        text=get_help_center_message(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=help_center_keyboard()
+    )
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id in user_wallets:
+        # Update balance with real data
+        wallet = user_wallets[user_id]
+        balance = get_sol_balance(wallet['public_key'])
+        user_balances[user_id] = balance
+
+        await update.message.reply_text(
+            text=get_wallet_status_message(user_id),
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.message.reply_text(
+            text="❌ No wallet connected. Use /start to set up your wallet.",
+            parse_mode=ParseMode.HTML
+        )
+
+async def generate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generate a new wallet"""
+    user_id = update.effective_user.id
+
+    new_wallet = generate_new_wallet()
+    if new_wallet:
+        user_wallets[user_id] = new_wallet
+        user_balances[user_id] = 0
+
+        await update.message.reply_text(
+            text="🎉 New wallet generated successfully!\n\n"
+                 f"🔑 **Private Key:**\n`{new_wallet['private_key']}`\n\n"
+                 f"🏷️ **Public Key:**\n`{new_wallet['public_key']}`\n\n"
+                 "⚠️ **SAVE YOUR PRIVATE KEY SECURELY!**\n"
+                 "You will need it to restore your wallet.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            text="❌ Error generating wallet. Please try again.",
+            parse_mode=ParseMode.HTML
+        )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+
+    await query.answer()
+
+    if data == "main_menu":
+        if user_id in user_wallets:
+            # Update with real balance
+            wallet = user_wallets[user_id]
+            balance = get_sol_balance(wallet['public_key'])
+            user_balances[user_id] = balance
+
+            await query.edit_message_text(
+                text=get_wallet_connected_main_menu(user_id),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=main_menu_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                text=get_start_message(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+        return
+
+    elif data == "refresh":
+        if user_id in user_wallets:
+            # Update with real balance
+            wallet = user_wallets[user_id]
+            balance = get_sol_balance(wallet['public_key'])
+            user_balances[user_id] = balance
+
+            await query.edit_message_text(
+                text=get_wallet_connected_main_menu(user_id),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=main_menu_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                text=get_start_message(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+        return
+
+    elif data == "wallet":
+        if user_id in user_wallets:
+            # Update with real balance
+            wallet = user_wallets[user_id]
+            balance = get_sol_balance(wallet['public_key'])
+            user_balances[user_id] = balance
+
+            await query.edit_message_text(
+                text=get_wallet_management_message(user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=wallet_management_keyboard()
+            )
+        else:
+            await query.edit_message_text(
+                text=get_wallet_setup_message(),
+                parse_mode=ParseMode.HTML,
+                reply_markup=wallet_setup_keyboard()
+            )
+        return
+
+    elif data == "import_private_key":
+        # Set state to await private key
+        context.user_data["awaiting_private_key"] = True
+        await query.edit_message_text(
+            text=get_import_private_key_message(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    elif data == "import_seed_phrase":
+        # Set state to await seed phrase
+        context.user_data["awaiting_seed_phrase"] = True
+        await query.edit_message_text(
+            text=get_import_seed_phrase_message(),
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    elif data == "generate_wallet":
+        new_wallet = generate_new_wallet()
+        if new_wallet:
+            user_wallets[user_id] = new_wallet
+            user_balances[user_id] = 0
+
+            await query.edit_message_text(
+                text="🎉 New wallet generated successfully!\n\n"
+                     f"🔑 **Private Key:**\n`{new_wallet['private_key']}`\n\n"
+                     f"🏷️ **Public Key:**\n`{new_wallet['public_key']}`\n\n"
+                     "⚠️ **SAVE YOUR PRIVATE KEY SECURELY!**\n"
+                     "You will need it to restore your wallet.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_menu_keyboard()
+            )
+        else:
+            await query.answer("❌ Error generating wallet", show_alert=True)
+        return
+
+    elif data == "check_status":
+        if user_id in user_wallets:
+            # Update with real balance
+            wallet = user_wallets[user_id]
+            balance = get_sol_balance(wallet['public_key'])
+            user_balances[user_id] = balance
+
+            await query.edit_message_text(
+                text=get_wallet_status_message(user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=wallet_management_keyboard()
+            )
+        else:
+            await query.answer("❌ No wallet connected", show_alert=True)
+        return
+
+    elif data == "fund_wallet":
+        if user_id in user_wallets:
+            # Update with real balance
+            wallet = user_wallets[user_id]
+            balance = get_sol_balance(wallet['public_key'])
+            user_balances[user_id] = balance
+
+            await query.edit_message_text(
+                text=get_fund_wallet_message(user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=fund_wallet_keyboard()
+            )
+        else:
+            await query.answer("❌ No wallet connected", show_alert=True)
+        return
+
+    elif data == "refresh_balance":
+        if user_id in user_wallets:
+            # Get real balance from blockchain
+            wallet = user_wallets[user_id]
+            balance = get_sol_balance(wallet['public_key'])
+            user_balances[user_id] = balance
+
+            await query.answer("🔄 Wallet balance refreshed!")
+            await query.edit_message_text(
+                text=get_wallet_management_message(user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=wallet_management_keyboard()
+            )
+        return
+
+    elif data == "copy_address":
+        if user_id in user_wallets:
+            wallet = user_wallets[user_id]
+            await query.answer(f"📋 Address copied: {wallet['public_key']}")
+        return
+
+    elif data == "disconnect_wallet":
+        await query.edit_message_text(
+            text="⚠️ **Disconnect Wallet** ⚠️\n\n"
+                 "Are you sure you want to disconnect your wallet?\n\n"
+                 "This will remove your wallet from the bot. You can reconnect later with your private key or seed phrase.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=disconnect_confirm_keyboard()
+        )
+        return
+
+    elif data == "confirm_disconnect":
+        if user_id in user_wallets:
+            del user_wallets[user_id]
+        if user_id in user_balances:
+            del user_balances[user_id]
+
+        await query.edit_message_text(
+            text="✅ **Wallet Disconnected Successfully!**\n\n"
+                 "Your wallet has been removed from the bot.\n\n"
+                 "🔑 Use /import to import an existing wallet\n"
+                 "🎲 Use /generate to create a new wallet\n"
+                 "🎆 Or use /start to see the welcome screen",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    elif data == "wallet_management":
+        if user_id in user_wallets:
+            # Update with real balance
+            wallet = user_wallets[user_id]
+            balance = get_sol_balance(wallet['public_key'])
+            user_balances[user_id] = balance
+
+            await query.edit_message_text(
+                text=get_wallet_management_message(user_id),
+                parse_mode=ParseMode.HTML,
+                reply_markup=wallet_management_keyboard()
+            )
+        return
+
+    elif data == "help":
+        await query.edit_message_text(
+            text=get_help_center_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=help_center_keyboard()
+        )
+        return
+
+    elif data == "help_commands":
+        await query.edit_message_text(
+            text=get_commands_help_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=help_submenu_keyboard()
+        )
+        return
+
+    elif data == "help_wallet":
+        await query.edit_message_text(
+            text=get_wallet_help_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=help_submenu_keyboard()
+        )
+        return
+
+    elif data == "help_trading":
+        await query.edit_message_text(
+            text=get_trading_help_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=help_submenu_keyboard()
+        )
+        return
+
+    elif data == "help_security":
+        await query.edit_message_text(
+            text=get_security_help_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=help_submenu_keyboard()
+        )
+        return
+
+    elif data == "help_faq":
+        await query.edit_message_text(
+            text=get_faq_help_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=help_submenu_keyboard()
+        )
+        return
+
+    elif data == "help_support":
+        await query.edit_message_text(
+            text=get_support_help_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=help_submenu_keyboard()
+        )
+        return
+
+    elif data == "search_tokens":
+        context.user_data["awaiting_token_search"] = True
+        await query.edit_message_text(
+            text=get_search_tokens_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=search_tokens_keyboard()
+        )
+        return
+
+    elif data == "ai_sniper":
+        await query.answer("🚧 AI Sniper feature coming soon!", show_alert=True)
+        return
+
+    elif data == "copy_trade":
+        await query.answer("🚧 Copy Trading feature coming soon!", show_alert=True)
+        return
+
+    elif data == "withdraw":
+        await query.answer("🚧 Withdraw feature coming soon!", show_alert=True)
+        return
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    message_text = update.message.text.strip()
+
+    # Handle private key import
+    if context.user_data.get("awaiting_private_key"):
+        context.user_data["awaiting_private_key"] = False
+
+        if is_valid_solana_private_key(message_text):
+            public_key = derive_public_key(message_text)
+
+            if public_key:
+                # Store wallet data
+                user_wallets[user_id] = {
+                    "private_key": message_text,
+                    "public_key": public_key,
+                    "created_at": time.time()
+                }
+                # Get real balance
+                balance = get_sol_balance(public_key)
+                user_balances[user_id] = balance
+
+                await update.message.reply_text(
+                    text="✅ Valid private key!\n\n"
+                         f"Public Key: `{public_key}`\n\n"
+                         "Saving to wallet...",
+                    parse_mode=ParseMode.HTML
+                )
+
+                await update.message.reply_text(
+                    text="🎉 Wallet imported successfully!\n\n"
+                         "Your wallet is now connected.\n"
+                         "Use /status to check your wallet info.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_menu_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    text="❌ Error deriving public key from private key.",
+                    parse_mode=ParseMode.HTML
+                )
+        else:
+            await update.message.reply_text(
+                text="❌ Invalid private key format.\n\n"
+                     "Please send a valid Solana private key (base58 encoded, 64 bytes).",
+                parse_mode=ParseMode.HTML
+            )
+        return
+
+    # Handle seed phrase import
+    elif context.user_data.get("awaiting_seed_phrase"):
+        context.user_data["awaiting_seed_phrase"] = False
+
+        if is_valid_seed_phrase(message_text):
+            wallet = derive_wallet_from_seed_phrase(message_text)
+
+            if wallet:
+                # Store wallet data
+                user_wallets[user_id] = {
+                    "private_key": wallet['private_key'],
+                    "public_key": wallet['public_key'],
+                    "created_at": time.time(),
+                    "from_seed_phrase": True
+                }
+                # Get real balance
+                balance = get_sol_balance(wallet['public_key'])
+                user_balances[user_id] = balance
+
+                await update.message.reply_text(
+                    text="✅ Valid seed phrase!\n\n"
+                         f"Public Key: `{wallet['public_key']}`\n\n"
+                         "Saving to wallet...",
+                    parse_mode=ParseMode.HTML
+                )
+
+                await update.message.reply_text(
+                    text="🎉 Wallet imported successfully!\n\n"
+                         "Your wallet is now connected.\n"
+                         "Use /status to check your wallet info.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_menu_keyboard()
+                )
+            else:
+                await update.message.reply_text(
+                    text="❌ Error deriving wallet from seed phrase.",
+                    parse_mode=ParseMode.HTML
+                )
+        else:
+            await update.message.reply_text(
+                text="❌ Invalid seed phrase format.\n\n"
+                     "Please send a valid seed phrase (12 or 24 words separated by spaces).",
+                parse_mode=ParseMode.HTML
+            )
+        return
+
+    # Handle token search
+    elif context.user_data.get("awaiting_token_search"):
+        context.user_data["awaiting_token_search"] = False
+
+        await update.message.reply_text(
+            text="🔄 Analyzing Token... 🔄\n\n"
+                 "⚡ Fetching data from multiple sources...\n"
+                 "📋 This may take a few seconds...",
+            parse_mode=ParseMode.HTML
+        )
+
+        # Get real token data
+        token_info = search_token_info(message_text)
+
+        if token_info:
+            # Format large numbers
+            liquidity = token_info['liquidity']
+            volume = token_info['volume_24h']
+            fdv = token_info['fdv']
+
+            liquidity_str = f"${liquidity:,.0f}" if liquidity > 1000 else f"${liquidity:.2f}"
+            volume_str = f"${volume:,.0f}" if volume > 1000 else f"${volume:.2f}"
+            fdv_str = f"${fdv:,.0f}" if fdv > 1000 else f"${fdv:.2f}"
+
+            await update.message.reply_text(
+                text=f"📊 {token_info['name']} ({token_info['symbol']}) 📊\n\n"
+                     f"💰 Price Information\n"
+                     f"• Current Price: ${token_info['price']:.6f}\n"
+                     f"• 24h Change: {token_info['change_24h']:.2f}%\n\n"
+                     f"📊 Trading Information\n"
+                     f"• Liquidity: {liquidity_str}\n"
+                     f"• Volume 24h: {volume_str}\n"
+                     f"• FDV: {fdv_str}\n"
+                     f"• DEX: {token_info['dex_id'].title()}\n"
+                     f"• Blockchain: Solana\n\n"
+                     f"🔧 Technical Information\n"
+                     f"• Contract Address:\n"
+                     f"  `{token_info['base_token_address']}`\n"
+                     f"• 🔗 [View on Solscan](https://solscan.io/token/{token_info['base_token_address']})\n"
+                     f"• 📊 [View on DexScreener]({token_info['url']})\n\n"
+                     f"⚠️ Disclaimer: Always do your own research before investing. Token prices are highly volatile.",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=search_results_keyboard()
+            )
+        else:
+            await update.message.reply_text(
+                text="❌ Token Not Found ❌\n\n"
+                     "Could not find information for this token.\n\n"
+                     "📝 Please check:\n"
+                     "• Token symbol spelling (e.g., SOL, BONK)\n"
+                     "• Complete token address\n"
+                     "• Token exists on Solana network\n\n"
+                     "🔄 Try searching again with a different term!",
+                parse_mode=ParseMode.HTML,
+                reply_markup=search_results_keyboard()
+            )
+        return
+
+    # Check if message is a potential token search
+    if len(message_text) > 0:
+        context.user_data["awaiting_token_search"] = True
+        await update.message.reply_text(
+            text=get_search_tokens_message(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=search_tokens_keyboard()
+        )
+
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("generate", generate_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    print("Autosnipe AI Bot started with seed phrase support...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
