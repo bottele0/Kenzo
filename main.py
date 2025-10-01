@@ -180,7 +180,7 @@ def get_wallet_connected_main_menu(user_id):
         f"• TOKENS: 0 ($0.00) — 0%\n\n"
         f"📈 SOL MARKET\n"
         f"${sol_price:.2f} ({'📈' if sol_change >= 0 else '📉'} {abs(sol_change):.1f}%) | Vol: ${volume:.2f}B\n\n"
-        f"🔗 View on Solscan: [Open Portfolio](https://solscan.io/account/{wallet.get('public_key', '')})"
+        f"🔗 View on Solscan: <a href=\"https://solscan.io/account/{wallet.get('public_key', '')}\">Open Portfolio</a>"
     )
 
 def get_wallet_management_message(user_id):
@@ -400,19 +400,30 @@ def is_valid_solana_private_key(private_key_b58: str) -> bool:
     try:
         decoded = base58.b58decode(private_key_b58)
     except Exception as e:
-        # invalid base58
+        print(f"Base58 decode error: {e}")
         return False
 
-    if len(decoded) not in (32, 64):
+    decoded_len = len(decoded)
+    print(f"Decoded key length: {decoded_len} bytes")
+
+    if decoded_len not in (32, 64):
+        print(f"Invalid key length: expected 32 or 64 bytes, got {decoded_len}")
         return False
 
     try:
-        if len(decoded) == 64:
+        if decoded_len == 64:
             # secret key format (64 bytes)
-            Keypair.from_secret_key(decoded)
+            kp = Keypair.from_secret_key(decoded)
+            print(f"Successfully validated 64-byte secret key")
         else:
-            # 32-byte seed
-            Keypair.from_seed(decoded)
+            # 32-byte seed - try from_seed first, if it fails try from_bytes
+            try:
+                kp = Keypair.from_seed(decoded)
+                print(f"Successfully validated 32-byte seed with from_seed")
+            except Exception as e:
+                print(f"from_seed failed: {e}, trying from_bytes")
+                kp = Keypair.from_bytes(decoded)
+                print(f"Successfully validated 32-byte key with from_bytes")
         return True
     except Exception as e:
         print(f"Private key validation error: {e}")
@@ -433,8 +444,13 @@ def derive_public_key(private_key_b58: str) -> str | None:
         if len(decoded) == 64:
             kp = Keypair.from_secret_key(decoded)
         elif len(decoded) == 32:
-            kp = Keypair.from_seed(decoded)
+            # Try from_seed first, then from_bytes
+            try:
+                kp = Keypair.from_seed(decoded)
+            except Exception:
+                kp = Keypair.from_bytes(decoded)
         else:
+            print(f"Invalid decoded length: {len(decoded)}")
             return None
         return str(kp.public_key)
     except Exception as e:
@@ -468,9 +484,19 @@ def get_sol_balance(public_key: str) -> float:
 def search_token_info(search_term):
     """Search for token information using DexScreener API (best-effort)."""
     try:
-        # DexScreener's API shapes vary; try a few endpoints / patterns
-        # Primary attempt: search endpoint
-        search_url = f"{DEXSCREENER_API}/search?q={search_term}"
+        # Check if search term looks like a Solana contract address (40-44 chars, alphanumeric)
+        is_contract_address = (
+            len(search_term) >= 40 and
+            len(search_term) <= 44 and
+            search_term.isalnum()
+        )
+
+        # Use tokens endpoint for contract addresses, search endpoint for symbols/names
+        if is_contract_address:
+            search_url = f"{DEXSCREENER_API}/tokens/{search_term}"
+        else:
+            search_url = f"{DEXSCREENER_API}/search?q={search_term}"
+
         search_response = requests.get(search_url, timeout=10)
         search_data = {}
         try:
@@ -636,9 +662,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
-    await query.answer()
-
     if data == "main_menu":
+        await query.answer()
         if user_id in user_wallets:
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
@@ -681,6 +706,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "wallet":
+        await query.answer()
         if user_id in user_wallets:
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
@@ -728,6 +754,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "generate_wallet":
         new_wallet = generate_new_wallet()
         if new_wallet:
+            await query.answer()
             user_wallets[user_id] = new_wallet
             user_balances[user_id] = 0
 
@@ -746,6 +773,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "check_status":
         if user_id in user_wallets:
+            await query.answer()
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -761,6 +789,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "fund_wallet":
         if user_id in user_wallets:
+            await query.answer()
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
@@ -780,7 +809,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             balance = get_sol_balance(wallet['public_key'])
             user_balances[user_id] = balance
 
-            await query.answer("🔄 Wallet balance refreshed!")
+            await query.answer("🔄 Wallet balance refreshed!", show_alert=True)
             await query.edit_message_text(
                 text=get_wallet_management_message(user_id),
                 parse_mode=ParseMode.HTML,
@@ -791,10 +820,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "copy_address":
         if user_id in user_wallets:
             wallet = user_wallets[user_id]
-            await query.answer(f"📋 Address copied: {wallet['public_key']}")
+            await query.answer(f"📋 Address copied: {wallet['public_key']}", show_alert=True)
         return
 
     elif data == "disconnect_wallet":
+        await query.answer()
         await query.edit_message_text(
             text="⚠️ **Disconnect Wallet** ⚠️\n\n"
                  "Are you sure you want to disconnect your wallet?\n\n"
@@ -805,6 +835,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "confirm_disconnect":
+        await query.answer()
         if user_id in user_wallets:
             del user_wallets[user_id]
         if user_id in user_balances:
@@ -821,6 +852,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "wallet_management":
+        await query.answer()
         if user_id in user_wallets:
             wallet = user_wallets[user_id]
             balance = get_sol_balance(wallet['public_key'])
@@ -834,6 +866,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "help":
+        await query.answer()
         await query.edit_message_text(
             text=get_help_center_message(),
             parse_mode=ParseMode.HTML,
@@ -842,6 +875,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "help_commands":
+        await query.answer()
         await query.edit_message_text(
             text=get_commands_help_message(),
             parse_mode=ParseMode.HTML,
@@ -850,6 +884,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "help_wallet":
+        await query.answer()
         await query.edit_message_text(
             text=get_wallet_help_message(),
             parse_mode=ParseMode.HTML,
@@ -858,6 +893,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "help_trading":
+        await query.answer()
         await query.edit_message_text(
             text=get_trading_help_message(),
             parse_mode=ParseMode.HTML,
@@ -866,6 +902,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "help_security":
+        await query.answer()
         await query.edit_message_text(
             text=get_security_help_message(),
             parse_mode=ParseMode.HTML,
@@ -874,6 +911,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "help_faq":
+        await query.answer()
         await query.edit_message_text(
             text=get_faq_help_message(),
             parse_mode=ParseMode.HTML,
@@ -882,6 +920,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "help_support":
+        await query.answer()
         await query.edit_message_text(
             text=get_support_help_message(),
             parse_mode=ParseMode.HTML,
@@ -890,6 +929,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif data == "search_tokens":
+        await query.answer()
         # Clear other awaiting flags
         context.user_data["awaiting_private_key"] = False
         context.user_data["awaiting_seed_phrase"] = False
@@ -1046,8 +1086,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      f"🔧 Technical Information\n"
                      f"• Contract Address:\n"
                      f"  `{token_info['base_token_address']}`\n"
-                     f"• 🔗 [View on Solscan](https://solscan.io/token/{token_info['base_token_address']})\n"
-                     f"• 📊 [View on DexScreener]({token_info['url']})\n\n"
+                     f"• 🔗 <a href=\"https://solscan.io/token/{token_info['base_token_address']}\">View on Solscan</a>\n"
+                     f"• 📊 <a href=\"{token_info['url']}\">View on DexScreener</a>\n\n"
                      f"⚠️ Disclaimer: Always do your own research before investing. Token prices are highly volatile.",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
